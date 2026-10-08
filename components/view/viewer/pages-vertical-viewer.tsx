@@ -384,6 +384,60 @@ export default function PagesVerticalViewer({
     ensurePagesLoaded?.(pageNumber);
   }, [pageNumber, ensurePagesLoaded]);
 
+  // `?p=N` sets the initial pageNumber, but the scroll container still starts
+  // at the top, so the counter shows page N while page 1 is visible. Scroll the
+  // start page into view once, as soon as its image has rendered and loaded.
+  // Scroll the container directly (not scrollIntoView) so an embedding page is
+  // not scrolled along with the iframe.
+  const initialPageRef = useRef<number>(pageNumber);
+  const didInitialScrollRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    const startPage = initialPageRef.current;
+    if (didInitialScrollRef.current || startPage <= 1) return;
+
+    let cancelled = false;
+    let frame = 0;
+    let attempts = 0;
+    let removeLoadListener: (() => void) | undefined;
+
+    const scrollToStartPage = (img: HTMLImageElement) => {
+      const container = containerRef.current;
+      if (cancelled || didInitialScrollRef.current || !container) return;
+      didInitialScrollRef.current = true;
+      const top =
+        img.getBoundingClientRect().top -
+        container.getBoundingClientRect().top +
+        container.scrollTop;
+      container.scrollTo({ top, behavior: "auto" });
+    };
+
+    const tryScroll = () => {
+      if (cancelled) return;
+      const img = imageRefs.current[startPage - 1];
+      if (!img) {
+        // The start page may still be a placeholder until its URL is signed.
+        if (attempts++ < 600) frame = requestAnimationFrame(tryScroll);
+        return;
+      }
+      if (img.complete && img.naturalHeight > 0) {
+        scrollToStartPage(img);
+        return;
+      }
+      const onLoad = () => scrollToStartPage(img);
+      img.addEventListener("load", onLoad, { once: true });
+      removeLoadListener = () => img.removeEventListener("load", onLoad);
+    };
+
+    frame = requestAnimationFrame(tryScroll);
+
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(frame);
+      removeLoadListener?.();
+    };
+  }, []);
+
   useEffect(() => {
     // Remove token and email query parameters on component mount
     const removeQueryParams = (queries: string[]) => {
