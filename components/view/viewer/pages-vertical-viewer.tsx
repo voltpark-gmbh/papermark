@@ -386,9 +386,15 @@ export default function PagesVerticalViewer({
 
   // `?p=N` sets the initial pageNumber, but the scroll container still starts
   // at the top, so the counter shows page N while page 1 is visible. Scroll the
-  // start page into view once, as soon as its image has rendered and loaded.
-  // Scroll the container directly (not scrollIntoView) so an embedding page is
-  // not scrolled along with the iframe.
+  // start page into view once, as soon as its image has loaded.
+  // - Scroll the container directly (not scrollIntoView) so an embedding page
+  //   is not scrolled along with the iframe.
+  // - Use "instant" so the container's `scroll-smooth` does not animate through
+  //   the pages before the start page.
+  // - Give up as soon as the reader scrolls or navigates, so a late image load
+  //   never pulls them back.
+  // - If the image errors or takes too long, position on it anyway: preceding
+  //   pages keep their height via placeholders, so its offset is still right.
   const initialPageRef = useRef<number>(pageNumber);
   const didInitialScrollRef = useRef<boolean>(false);
 
@@ -396,45 +402,70 @@ export default function PagesVerticalViewer({
     const startPage = initialPageRef.current;
     if (didInitialScrollRef.current || startPage <= 1) return;
 
-    let cancelled = false;
+    const MAX_WAIT_MS = 10_000;
+    const deadline = Date.now() + MAX_WAIT_MS;
     let frame = 0;
-    let attempts = 0;
-    let removeLoadListener: (() => void) | undefined;
+    let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+    let removeImageListeners: (() => void) | undefined;
+
+    const stop = () => {
+      didInitialScrollRef.current = true;
+      cancelAnimationFrame(frame);
+      if (fallbackTimer) clearTimeout(fallbackTimer);
+      removeImageListeners?.();
+      window.removeEventListener("wheel", stop, true);
+      window.removeEventListener("touchstart", stop, true);
+      window.removeEventListener("pointerdown", stop, true);
+      window.removeEventListener("keydown", stop, true);
+    };
+
+    // Any reader interaction cancels the pending initial scroll.
+    window.addEventListener("wheel", stop, { capture: true, passive: true });
+    window.addEventListener("touchstart", stop, { capture: true, passive: true });
+    window.addEventListener("pointerdown", stop, true);
+    window.addEventListener("keydown", stop, true);
 
     const scrollToStartPage = (img: HTMLImageElement) => {
       const container = containerRef.current;
-      if (cancelled || didInitialScrollRef.current || !container) return;
-      didInitialScrollRef.current = true;
+      if (didInitialScrollRef.current || !container) return;
       const top =
         img.getBoundingClientRect().top -
         container.getBoundingClientRect().top +
         container.scrollTop;
-      container.scrollTo({ top, behavior: "auto" });
+      stop();
+      container.scrollTo({ top, behavior: "instant" });
     };
 
     const tryScroll = () => {
-      if (cancelled) return;
+      if (didInitialScrollRef.current) return;
       const img = imageRefs.current[startPage - 1];
       if (!img) {
         // The start page may still be a placeholder until its URL is signed.
-        if (attempts++ < 600) frame = requestAnimationFrame(tryScroll);
+        if (Date.now() < deadline) frame = requestAnimationFrame(tryScroll);
+        else stop();
         return;
       }
       if (img.complete && img.naturalHeight > 0) {
         scrollToStartPage(img);
         return;
       }
-      const onLoad = () => scrollToStartPage(img);
-      img.addEventListener("load", onLoad, { once: true });
-      removeLoadListener = () => img.removeEventListener("load", onLoad);
+      const onSettled = () => scrollToStartPage(img);
+      img.addEventListener("load", onSettled, { once: true });
+      img.addEventListener("error", onSettled, { once: true });
+      removeImageListeners = () => {
+        img.removeEventListener("load", onSettled);
+        img.removeEventListener("error", onSettled);
+      };
+      fallbackTimer = setTimeout(onSettled, Math.max(0, deadline - Date.now()));
     };
 
     frame = requestAnimationFrame(tryScroll);
 
     return () => {
-      cancelled = true;
-      cancelAnimationFrame(frame);
-      removeLoadListener?.();
+      // Unmount (or StrictMode re-run): clean up without marking as done.
+      const done = didInitialScrollRef.current;
+      stop();
+      didInitialScrollRef.current = done;
     };
   }, []);
 
